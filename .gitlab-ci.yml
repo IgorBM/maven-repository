@@ -1,0 +1,276 @@
+variables:
+  MAVEN_OPTS: -Dmaven.repo.local=${CI_PROJECT_DIR}/.m2/repository
+  WAR_FILE: $CI_PROJECT_DIR/target/java-web-project*.war
+
+cache:
+  paths:
+  - .m2/repository
+
+stages:
+- build
+- deploy_artifacts
+- scan_vuln
+- deploy_app
+
+mvn-build-war:
+  stage: build
+  image: maven:3.3.9-jdk-8
+  tags:
+  - linux
+  artifacts:
+    paths:
+    - target/
+  script:
+  - maven_build_war
+  only:
+  - develop
+  - master
+  - branches
+  - merge_requests
+
+scan-sast:
+  stage: scan_vuln
+  image: maven:3.3.9-jdk-8
+  tags:
+  - linux
+  script:
+  - scan_sast
+  only:
+  - develop
+
+scan-sca-maven:
+  stage: scan_vuln
+  image: maven:3.3.9-jdk-8
+  tags:
+  - linux
+  script:
+  - scan_sca_maven
+  only:
+  - develop
+
+scan-sca-docker:
+  stage: scan_vuln
+  image: maven:3.3.9-jdk-8
+  tags:
+  - linux
+  script:
+  - scan_sca_docker
+  only:
+  - develop
+
+deploy-docker:
+  stage: deploy_artifacts
+  tags:
+  - linux
+  image: docker:git
+  services:
+  - docker:dind
+  script:
+  - setup_docker
+  - build
+  only:
+  - master
+  - develop
+  except:
+    refs:
+    - merge_requests
+
+mvn-deploy-war:
+  stage: deploy_artifacts
+  image: nexus.service.swordfishsecurity.com:8083/sfs-maven:3.3.9-jdk-8
+  tags:
+  - linux
+  script:
+  - deploy_nexus
+  only:
+  - develop
+  except:
+    variables:
+    - $CI_COMMIT_MESSAGE =~ /^nopipeline/
+
+deploy-app:
+  stage: deploy_app
+  tags:
+  - linux
+  script:
+  - ls
+  only:
+  - develop
+  - master
+  - branches
+  - merge_requests
+
+.auto_devops: &auto_devops |
+  [[ "$TRACE" ]] && set -x
+
+  function maven_build_war() {
+    mvn package
+    version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    echo "$version" > $CI_PROJECT_DIR/target/artifact_version
+  }
+
+  function setup_docker() {
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  }
+
+  function build() {
+    echo "Building Dockerfile-based application..."
+    echo "app: $CI_PROJECT_PATH:$CI_APPLICATION_TAG"
+    artifact_version=$(cat $CI_PROJECT_DIR/target/artifact_version)
+    export version="$artifact_version"
+    export DOCKER_IMAGE="$CI_PROJECT_NAME"
+    docker build -t "$DOCKER_IMAGE:$version" .
+    export HUB_DOCKER_USERNAME="$NEXUS_USERNAME"
+    export HUB_DOCKER_PASSWORD="$NEXUS_USERNAME_PASSWORD"
+
+    if [[ -n "$HUB_DOCKER_USERNAME" ]]; then
+      echo "Logging to Nexus Container Registry with CI credentials..."
+      docker login -u "$HUB_DOCKER_USERNAME" -p "$HUB_DOCKER_PASSWORD" nexus.service.swordfishsecurity.com:8083
+      echo ""
+    fi
+    echo "Pushing to Nexus Container Registry..."
+    docker tag $DOCKER_IMAGE:$version nexus.service.swordfishsecurity.com:8083/$DOCKER_IMAGE:$version
+    docker push nexus.service.swordfishsecurity.com:8083/$DOCKER_IMAGE:$version
+    docker tag $DOCKER_IMAGE:$version nexus.service.swordfishsecurity.com:8083/$DOCKER_IMAGE:latest
+    docker push nexus.service.swordfishsecurity.com:8083/$DOCKER_IMAGE:latest
+    echo "done"
+  }
+
+  function set_setting_maven() {
+    echo " \
+       <settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\" \
+          xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+          xsi:schemaLocation=\"http://maven.apache.org/SETTINGS/1.0.0 \
+                      https://maven.apache.org/xsd/settings-1.0.0.xsd\"> \
+          <localRepository>.m2/repository</localRepository> \
+          <servers> \
+            <server> \
+              <id>nexus</id> \
+              <username>$NEXUS_USERNAME_ADMIN</username> \
+              <password>$NEXUS_USERNAME_ADMIN_PASSWORD</password> \
+            </server> \
+          </servers> \
+      </settings> \
+    " >  $HOME/.m2/settings.xml
+  }
+
+  function scan_sast() {
+    version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    curl -H "Content-Type: application/json" -H "X-Authorization: Token:$TOKEN" -X POST $HUB_URL/hub/rest/scan/sast \
+      --data "{\"application\": \"$CI_PROJECT_NAME\", \
+                   \"vcsType\": \"$CODEBASE_VCS_TYPE\", \
+                       \"url\": \"$CODEBASE_URL\", \
+                    \"branch\": \"$CODEBASE_BRANCH\"}" \
+      -o start_job_response.json
+    loop_checkout_status
+  }
+
+  function scan_sca_maven() {
+    version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    groupId=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+    artifactId=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+    curl -H "Content-Type: application/json" -H "X-Authorization: Token:$TOKEN" -X POST $HUB_URL/hub/rest/scan/sca \
+      --data "{\"application\": \"$CI_PROJECT_NAME\", \
+        \"repository\": { \
+          \"url\": \"$NEXUS_URL\", \
+          \"name\": \"maven-releases\" \
+        }, \
+        \"format\": \"MAVEN\", \
+        \"artifact\": { \
+          \"name\": \"$artifactId\", \
+          \"group\": \"$groupId\", \
+          \"version\": \"$version\", \
+          \"type\": \"$MAVEN_ARTIFACT_TYPE\" \
+        }}" \
+      -o start_job_response.json
+    loop_checkout_status
+  }
+
+  function scan_sca_docker() {
+    version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    if [[ -z "$DOCKER_PORT" ]]; then
+      dockerPort="8083"
+    else
+      dockerPort="$DOCKER_PORT"
+    fi
+    curl -H "Content-Type: application/json" -H "X-Authorization: Token:$TOKEN" -X POST $HUB_URL/hub/rest/scan/sca \
+      --data "{
+        \"application\": \"$CI_PROJECT_NAME\",
+        \"repository\": { \
+          \"url\": \"$NEXUS_URL\", \
+          \"name\": \"docker-private\", \
+          \"port\": \"$dockerPort\" \
+        }, \
+        \"format\": \"DOCKER\", \
+        \"artifact\": { \
+          \"name\": \"$CI_PROJECT_NAME\", \
+          \"version\": \"$version\" \
+        }}" \
+      -o start_job_response.json
+    loop_checkout_status
+  }
+
+  function loop_checkout_status() {
+      echo "'Start scan task' REST API call response:"
+      cat start_job_response.json
+      {
+        scanTaskId=$(cat start_job_response.json | python -c "import sys, json; print json.load(sys.stdin)['scanTaskId']")
+        startStatus=$(cat start_job_response.json | python -c "import sys, json; print json.load(sys.stdin)['status']")
+      } || {
+        scanTaskId=""
+        startStatus=""
+      }
+      {
+        errorMessage=$(cat start_job_response.json | python -c "import sys, json; print json.load(sys.stdin)['errorMessage']")
+      } || {
+        errorMessage="No error messages"
+      }
+      taskStatus=""
+      numberOfTries=1
+      if [[ "$scanTaskId" == "" && "$errorMessage" == "No error messages" ]]; then
+        exit 1
+      fi
+      if [[ "$startStatus" == "Scan started" ]]; then
+        while [[ true ]]
+        do
+          echo "Sleep for 30 sec..."
+          sleep 30
+          echo "Fetching status of the scan task #$scanTaskId, try $numberOfTries..."
+          curl -H "Content-Type: application/json" -H "X-Authorization: Token:$TOKEN" -X GET $HUB_URL/hub/rest/scan/$scanTaskId -o job_status.json
+          echo "'Scan task status' REST API call response:"
+          cat job_status.json
+          taskStatus=$(cat job_status.json | python -c "import sys, json; print json.load(sys.stdin)['status']")
+          echo ""
+          echo "taskStatus:"
+          echo $taskStatus
+          if [[ "$taskStatus" == "SUCCESS" ]]; then
+            echo ""
+            echo "Scan task #$scanTaskId finished successfully"
+            break
+          fi
+          if [[ "$taskStatus" = "FAILED" ]]; then
+            echo ""
+            echo "Scan task #$scanTaskId failed" >&2
+            exit 1
+          fi
+          numberOfTries=$((numberOfTries+1))
+        done
+      else
+        echo "errorMessage:"
+        echo $errorMessage
+      fi
+  }
+
+  function deploy_nexus() {
+      set_setting_maven
+      export WAR_FILE_PATH=$(ls $WAR_FILE)
+      echo $WAR_FILE_PATH
+      mvn deploy:deploy-file -DgeneratePom=false -DrepositoryId=nexus -Dpackaging=war -Durl=$NEXUS_URL/repository/maven-releases/ -DpomFile=pom.xml -Dfile=$WAR_FILE_PATH
+  }
+
+before_script:
+- *auto_devops
